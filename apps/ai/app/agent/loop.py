@@ -16,6 +16,7 @@ import asyncio
 import json
 import time
 import traceback
+import uuid
 from collections.abc import AsyncIterator
 
 from app.clients import LLMClient, LLMRequest, LLMText, LLMToolCall, LLMUsage
@@ -57,6 +58,27 @@ async def run_agent(
     usage = Usage(input_tokens=0, output_tokens=0)
 
     try:
+        if negotiation_first:
+            from app.services.negotiation import approval_matches, pending
+            basket = pending(session_id)
+            if approval_matches(messages, basket):
+                # The approved immutable basket determines the operation, not a new LLM interpretation.
+                call = ToolCall(id=f"accept_{uuid.uuid4().hex}", name="accept_negotiated_offer",
+                                arguments={"quoteId": basket.id})
+                yield ToolCallEvent(call=call)
+                messages.append(ChatMessage(role="assistant", content="", tool_calls=[call]))
+                result = await execute_tool(call, tools, ctx)
+                messages.append(ChatMessage(role="tool", tool_call_id=result.call_id, name=result.name,
+                                            content=to_json(result.result)))
+                yield result
+                text = result.result.get("say") if result.ok and isinstance(result.result, dict) else None
+                if not text:
+                    text = "L'offre n'a pas pu être enregistrée. Il faut vérifier son état dans l'ERP avant de réessayer."
+                message = ChatMessage(role="assistant", content=text)
+                messages.append(message)
+                yield TextEvent(delta=text)
+                yield DoneEvent(message=message, usage=usage, ms=ms_since(started))
+                return
         system = await build_system_prompt(mode, actor_name, negotiation_first=True) if negotiation_first else await build_system_prompt(mode, actor_name)
         # Voice and one-shot commands: no reasoning pass before answering (settings.voice_thinking, VOICE_THINKING).
         thinking = settings.voice_thinking if mode in ("voice", "command") else None

@@ -59,8 +59,10 @@ class OfferBoard:
             return self._product(args.get("qty"), result)
         if name == "source_product":
             return self._sourced(args, result)
-        if name == "negotiate_basket" and result.get("found"):
+        if name == "negotiate_basket":
             self.lines.clear()
+            if not result.get("found"):
+                return True  # withdraw a previous offer if the replacement cannot be quoted
             for item in result.get("lines", []):
                 label = item["product"]
                 self.lines[label] = OfferLine(product=label, qty=item["qty"], unit=item["unit"],

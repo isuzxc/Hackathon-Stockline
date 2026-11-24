@@ -28,3 +28,5 @@ Check that the ERP remains unchanged during negotiation and that a short "oui" c
 Run cd apps/ai && uv run pytest. The old voice path is available for regression comparison.
 
 The existing market dashboard now streams real request/quote events per product, including withdrawn quotes and the final procurement allocation. For a multi-product basket the dashboard follows the latest product round; the voice offer card displays the entire basket. The trace represents quote selection, not supplier acceptance.
+
+An exact short approval triggers acceptance deterministically before calling the LLM again. Preliminary catalog prices are no longer displayed as final offers in negotiation-first mode.

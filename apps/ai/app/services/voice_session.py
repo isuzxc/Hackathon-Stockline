@@ -648,6 +648,8 @@ class VoiceConnection:
         """Customer-facing offer card from tool results (never supplier names, costs or ids)."""
         changed = False
         for call, result, _ in calls:
+            if negotiation_enabled() and call.name != "negotiate_basket":
+                continue  # never present a catalog lookup as the negotiated customer price
             changed |= board.add(call.name, call.arguments, result)
         if changed:
             await self.send(AgentOfferMessage(lines=board.snapshot()))
