@@ -27,7 +27,7 @@ from app.agent.prompts import get_meta
 from app.agent.speak_fr import say_date, say_price
 from app.tools import ErpClient
 
-from . import voices
+from . import voices, live_agents
 from .round import MAX_COUNTERS, ROUNDS, MarketRound, arrival, fetch_profile
 from . import levers
 from .levers import LABELS, LeverMemory, available, buyer_line, sensitivity
@@ -168,6 +168,10 @@ class Sourcing:
     round_id: str | None = None
     orders: list[dict] = field(default_factory=list)  # purchase orders placed (after the caller's yes)
     available: float = 0.0  # our own stock when the caller asked: the producers are needed beyond this
+    mode: str = "legacy"
+    quotes: dict = field(default_factory=dict)
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    placed_suppliers: set[str] = field(default_factory=set)
 
 
 SOURCINGS: dict[str, Sourcing] = {}
@@ -238,15 +242,46 @@ async def source(erp: ErpClient, product_id: str, wanted: float, client_id: str 
                             await asyncio.gather(*(cached_profile(erp, s["supplierId"]) for s in suppliers)), strict=True))  # fmt: skip
     in_time = {sid: p for sid, p in profiles_all.items() if arrival(today, p) <= deliver_by}
     late = not in_time  # nobody in time: negotiate with everyone, the caller decides on the later date
-    profiles = in_time or profiles_all
+    negotiation_mode = live_agents.mode()
+    profiles = profiles_all if negotiation_mode == "external" else (in_time or profiles_all)
     line = NeedLine(product_id, src["name"], unit, src["category"], src["cost"], shortfall,
                     {s["supplierId"]: s["price"] for s in suppliers if "price" in s and s["supplierId"] in profiles})  # fmt: skip
     sid_ = uuid.uuid4().hex[:8]
-    script = negotiate([line], profiles, seed=f"express|{product_id}|{today}", urgent=True, memory=levers.MEMORY)
-    levers.MEMORY.learn(script)  # what each lever obtained from each producer: the next call starts from it
+    seed = f"express|{product_id}|{today}"
+    quotes = {}
+    if negotiation_mode == "legacy":
+        script = negotiate([line], profiles, seed=seed, urgent=True, memory=levers.MEMORY)
+        levers.MEMORY.learn(script)
+        arrivals = {sid: arrival(today, p).isoformat() for sid, p in profiles.items()}
+    else:
+        agents, usable, decision = await live_agents.run(
+            line, profiles, today, deliver_by, seed, external=negotiation_mode == "external",
+            endpoints=live_agents.external_endpoints() if negotiation_mode == "external" else None)
+        profiles = {sid: profiles[sid] for sid in agents}
+        quotes = {q.offer.supplier_id: q for q in usable}
+        arrivals = {sid: q.arrives.isoformat() for sid, q in quotes.items()}
+        steps = {}
+        for sid, agent in agents.items():
+            steps[sid] = []
+            previous = None
+            for exchange in agent.history:
+                if exchange.quote is None:
+                    steps[sid].append(Step("quote", []))
+                    continue
+                o = exchange.quote.offer
+                if previous is None:
+                    steps[sid].append(Step("quote", [o]))
+                else:
+                    steps[sid].append(Step("counter", [o], product_id, exchange.rival, previous.price, o.price,
+                                           exchange.tactic if exchange.tactic in LABELS else None))
+                previous = o
+        script = Script(steps, [q.offer for q in usable], decision)
+        late = any(q.arrives > deliver_by for q in usable)
+        if negotiation_mode == "demo":
+            levers.MEMORY.learn(script)
     d = script.decision
-    arrivals = {sid: arrival(today, p).isoformat() for sid, p in profiles.items()}
-    sourcing = Sourcing(sid_, client_id, line, profiles, script, arrivals, available=max(available, 0))
+    sourcing = Sourcing(sid_, client_id, line, profiles, script, arrivals, available=max(available, 0),
+                        mode=negotiation_mode, quotes=quotes)
     SOURCINGS[sid_] = sourcing
     for old in list(SOURCINGS)[:-20]:
         SOURCINGS.pop(old, None)
@@ -276,11 +311,11 @@ async def source(erp: ErpClient, product_id: str, wanted: float, client_id: str 
         "sourcingId": sid_, "product": short(src["name"]), "unit": unit, "wanted": wanted, "available": available,
         "shortfall": shortfall, "covered": covered, "uncovered": max(0.0, round(shortfall - covered, 3)),
         "inTime": not late, "deliverBy": deliver_by.isoformat(), "offers": kept,
-        "negotiated": {"saved": d.savings, "suppliersCalled": len(profiles)},
+        "negotiated": {"saved": d.savings, "suppliersCalled": len(profiles), "mode": negotiation_mode},
         "say": say + ".",
         "next": "Propose-le au client en une phrase. Après son oui : commande la quantité totale au client, puis create_supplier_orders(sourcingId).",  # fmt: skip
     }
-    if replay:
+    if replay and profiles and negotiation_mode != "external":
         r = ExpressRound(sourcing, erp=erp, title=f"Marché express : {short(src['name'])}", need_by=latest or deliver_by.isoformat())
         ROUNDS[r.id] = r
         for old in list(ROUNDS)[:-5]:
@@ -296,7 +331,12 @@ async def place_orders(erp: ErpClient, sourcing_id: str) -> dict[str, Any]:
     s = SOURCINGS.get(sourcing_id)
     if not s:
         raise ValueError("Marché express introuvable (trop ancien ou service redémarré) : relance source_product.")
-    if s.orders:  # idempotent: the model may retry
+    async with s.lock:
+        return await _place_orders(erp, s)
+
+
+async def _place_orders(erp: ErpClient, s: Sourcing) -> dict[str, Any]:
+    if s.orders and len(s.placed_suppliers) == len({a.supplier_id for a in s.script.decision.allocations}):
         return {"orders": s.orders, "alreadyPlaced": True}
     if not s.script.decision.allocations:
         raise ValueError("Ce marché express n'a trouvé aucun producteur : rien à commander.")
@@ -304,10 +344,19 @@ async def place_orders(erp: ErpClient, sourcing_id: str) -> dict[str, Any]:
     for a in s.script.decision.allocations:
         by_supplier.setdefault(a.supplier_id, []).append(a)
     for sid, allocs in by_supplier.items():
+        if sid in s.placed_suppliers:
+            continue
+        if s.mode == "external":
+            from datetime import datetime, timezone
+            if s.quotes[sid].expires <= datetime.now(timezone.utc):
+                raise ValueError("Offre fournisseur expirée : relance source_product.")
         body = {"supplierId": sid, "expectedDate": s.arrivals[sid],
                 "note": f"{EXPRESS_NOTE} ({s.client_id or 'appel client'}) : prix négociés par l'agent achats",
                 "lines": [{"productId": a.product_id, "qty": a.qty, "unitPrice": a.price} for a in allocs]}  # fmt: skip
+        if s.mode == "external":
+            body["note"] += f" (devis externe {s.quotes[sid].quote_id}; à confirmer auprès du fournisseur)"
         po = await erp.post("/api/purchase-orders", body)
+        s.placed_suppliers.add(sid)
         s.orders.append({"number": po.get("number"), "supplier": s.profiles[sid].name, "totalHt": po.get("totalHt")})
         r = ROUNDS.get(s.round_id or "")
         if r:
@@ -329,6 +378,8 @@ async def place_for_order(erp: ErpClient, order: dict) -> list[dict]:
             continue
         seen.add(pid)
         if s.orders or not s.script.decision.allocations or qty[pid] <= s.available + 1e-9:
+            continue
+        if s.mode == "external" and (s.client_id != order.get("clientId") or abs(qty[pid] - s.available - s.line.need) > 0.501 or s.script.decision.uncovered):
             continue
         placed += (await place_orders(erp, s.id))["orders"]
     return placed
