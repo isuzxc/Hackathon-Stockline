@@ -403,13 +403,14 @@ async def preload(working: list[ChatMessage], erp: ErpClient, on_status: StatusF
             await status("Vérification du stock…")
             await status("Comparaison des prix…")
             from app.market.express import source  # the market imports the tools: imported when needed
+            from app.market.live_agents import mode
 
             t1 = time.perf_counter()
             calls = [_call("source_product", {"productId": r["product"]["id"], "qty": a["qty"], **({"clientId": client_id} if client_id else {}),
                                               **({"deliveryDate": delivery} if delivery else {})}) for a, r in short]  # fmt: skip
             try:  # bounded: past MARKET_BUDGET_S the model answers with the stock and calls source_product itself
                 sourced = await asyncio.wait_for(asyncio.gather(*(source(erp, c.arguments["productId"], c.arguments["qty"], client_id, delivery)
-                                                                  for c in calls), return_exceptions=True), MARKET_BUDGET_S)  # fmt: skip
+                                                                  for c in calls), return_exceptions=True), MARKET_BUDGET_S if mode() == 'legacy' else 7.0)  # fmt: skip
             except TimeoutError:
                 sourced = [TimeoutError()] * len(calls)
             ms = int((time.perf_counter() - t1) * 1000)
