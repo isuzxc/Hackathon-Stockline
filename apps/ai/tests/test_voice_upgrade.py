@@ -210,6 +210,8 @@ class RecordingTTS(MockTTS):
 
 
 def session_with(monkeypatch, steps, tts):
+    # These tests target the original streaming/filler fast path.
+    monkeypatch.setattr(voice_session, "negotiation_enabled", lambda: False)
     async def no_fast_path(*args, **kwargs):  # these tests are about the model path (fast paths: test_fast_path.py)
         return None
 

@@ -20,6 +20,7 @@ from app.agent.speak_fr import say_date, say_price
 from app.market import live_agents
 from app.market.express import cached_profile, supply_blocked
 from app.market.strategy import NeedLine, Offer, SupplierProfile
+from app.market.round import MarketRound, ROUNDS
 from app.tools.erp import enc
 from app.tools.voice import next_delivery, say_line
 
@@ -122,22 +123,91 @@ async def quote_line(erp, client_id, request, today, delivery, market_mode):
     profiles = {sid: p for sid, p in zip(ids, loaded, strict=True) if isinstance(p, SupplierProfile)}
     line = NeedLine(product_id, src["name"], unit, src["category"], float(src["cost"]), quantity,
                     {s["supplierId"]: s["price"] for s in suppliers if "price" in s})
-    agents, quotes = {}, []
-    if deadline >= today and profiles:
-        agents, quotes, _ = await live_agents.run(
-            line, profiles, today, deadline, f"voix|{product_id}|{today}",
-            external=market_mode == "external",
-            endpoints=live_agents.external_endpoints() if market_mode == "external" else None,
-        )
-    quotes = [q for q in quotes if q.arrives <= deadline and q.expires > datetime.now(timezone.utc)]
-    # Existing stock is an alternative, not a fake competitor shared with shops.
+    # Register a real event stream before opening the supplier conversations.
+    # The dashboard shows actual structured requests and replies, not generated dialogue.
     stock_qty = min(quantity, max(0.0, float(src.get("available") or 0)))
+    endpoints = live_agents.external_endpoints() if market_mode == "external" else None
+    contacted = {sid: p for sid, p in profiles.items()
+                 if deadline >= today and (market_mode != "external" or sid in endpoints)}
+    trace = MarketRound(erp=erp, pace=0)
+    ROUNDS[trace.id] = trace
+    for key in list(ROUNDS)[:-10]:
+        if ROUNDS[key].done:
+            ROUNDS.pop(key, None)
+    title = "Voix • " + ("simulation • " if market_mode == "demo" else "devis HTTPS • ") + line.name
+    suppliers_view = [{"id": sid, "name": p.name, "called": sid in contacted,
+                       "reliability": p.reliability, "flexibility": p.flexibility}
+                      for sid, p in profiles.items()]
     if stock_qty >= step:
-        profiles[STOCK] = SupplierProfile(STOCK, "Stock interne", reliability=3)
-        quotes.append(live_agents.Quote(
-            Offer(STOCK, product_id, line.cost, stock_qty, True, opening=line.cost),
-            today, datetime.now(timezone.utc) + timedelta(minutes=3), "internal"))
-    decision = live_agents.optimize(line, quotes, profiles, strict_min=market_mode == "external")
+        suppliers_view.append({"id": STOCK, "name": "Stock interne", "called": False})
+    agents, quotes = {}, []
+    try:
+        await trace.emit("round_started", title=title, reference="Négociation non engageante avant accord client",
+            needBy=deadline.isoformat(),
+            needs=[{"productId": product_id, "name": line.name, "unit": unit, "category": line.category,
+                    "need": quantity, "listPrice": line.reference_price, "suppliers": list(contacted)}],
+            suppliers=suppliers_view)
+        for sid in profiles:
+            if sid in contacted:
+                await trace.emit("call_ringing", call=sid)
+                await trace.emit("call_connected", call=sid)
+            else:
+                await trace.emit("call_skipped", call=sid, reason="Pas de délai ou d’endpoint compatible")
+
+        async def exchange_event(sid, exchange):
+            request = exchange.request
+            tactic = request["tactic"]
+            if exchange.rival:
+                await trace.emit("intel", call=sid, fromCall=exchange.rival.supplier_id,
+                                 productId=product_id, price=exchange.rival.price)
+            await trace.emit("line", call=sid, speaker="buyer",
+                text=f"{tactic} : {quantity:g} {unit}, avant {deadline.isoformat()}" +
+                     (f" ; offre concurrente {request['competingUnitPrice']:.2f} EUR" if "competingUnitPrice" in request else ""))
+            if exchange.quote:
+                q = exchange.quote
+                o = q.offer
+                await trace.emit("line", call=sid, speaker="supplier",
+                    text=f"Devis : {o.qty:g} {unit} à {o.price:.2f} EUR, arrivée {q.arrives.isoformat()}")
+                await trace.emit("offer", call=sid, offers=[{"productId": product_id, "price": o.price,
+                    "qty": o.qty, "final": o.final, "regular": sid in line.list_prices}], final=o.final)
+            else:
+                await trace.emit("line", call=sid, speaker="supplier", text="Aucun devis valide reçu.")
+                await trace.emit("offer", call=sid, offers=[], withdrawnProductId=product_id, final=True)
+
+        if contacted:
+            agents, quotes, _ = await live_agents.run(
+                line, contacted, today, deadline, f"voix|{product_id}|{today}",
+                external=market_mode == "external", endpoints=endpoints, on_exchange=exchange_event)
+        quotes = [q for q in quotes if q.arrives <= deadline and q.expires > datetime.now(timezone.utc)]
+        if stock_qty >= step:
+            profiles[STOCK] = SupplierProfile(STOCK, "Stock interne", reliability=3)
+            quotes.append(live_agents.Quote(
+                Offer(STOCK, product_id, line.cost, stock_qty, True, opening=line.cost),
+                today, datetime.now(timezone.utc) + timedelta(minutes=3), "internal"))
+            await trace.emit("offer", call=STOCK, offers=[{"productId": product_id, "price": line.cost,
+                "qty": stock_qty, "final": True, "regular": False}], final=True)
+        decision = live_agents.optimize(line, quotes, profiles, strict_min=market_mode == "external")
+        await trace.emit("decision", allocations=[{"supplierId": a.supplier_id, "productId": a.product_id,
+            "qty": a.qty, "price": a.price} for a in decision.allocations],
+            uncovered=decision.uncovered, total=decision.total, reference=decision.reference,
+            savings=decision.savings, needed=decision.needed, covered=decision.covered)
+        for sid in [*contacted, *([STOCK] if stock_qty >= step else [])]:
+            selected = [a for a in decision.allocations if a.supplier_id == sid]
+            await trace.emit("call_ended", call=sid, won=bool(selected), total=round(sum(a.qty * a.price for a in selected), 2))
+        await trace.emit("summary", text="Sélection de devis uniquement ; aucune commande passée.",
+            total=decision.total, reference=decision.reference, savings=decision.savings,
+            savingsPct=round(100 * decision.savings / decision.reference, 1) if decision.reference else 0,
+            suppliers=len({a.supplier_id for a in decision.allocations if a.supplier_id != STOCK}),
+            called=len(agents), coverage=round(100 * decision.covered / quantity),
+            coverageRegular=round(100 * sum(a.qty for a in decision.allocations if a.supplier_id in line.list_prices) / quantity))
+    except BaseException:
+        await trace.emit("error", message="Négociation interrompue ou impossible.")
+        raise
+    finally:
+        async with trace.updated:
+            trace.done = True
+            trace.updated.notify_all()
+    # Existing stock is an alternative, not a fake competitor shared with shops.
     if decision.covered + 1e-8 < quantity:
         raise ValueError(f"{src['name']} : seulement {decision.covered:g} {unit} disponibles à temps sur {quantity:g}.")
     baseline = float(price["price"])
@@ -167,8 +237,8 @@ async def quote_basket(ctx, client_id, requests, delivery_date):
     if not ctx.session_id:
         raise ValueError("Offre disponible uniquement dans une session Voix.")
     old = pending(ctx.session_id)
-    if old and old.state == "processing":
-        raise ValueError("Une acceptation est déjà en cours.")
+    if old and old.state in ("processing", "review"):
+        raise ValueError("Une acceptation précédente doit être vérifiée dans l’ERP.")
     # Invalidate even when the replacement cannot be quoted.
     BASKETS.pop(ctx.session_id, None)
     for key, b in list(BASKETS.items()):

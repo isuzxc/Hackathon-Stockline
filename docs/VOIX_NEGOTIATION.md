@@ -26,3 +26,5 @@ Use a real configured LLM for Voix; the old mock LLM is not a natural language n
 Restart the AI service after editing .env. Test with a known customer, exact product, quantity and valid route day.
 Check that the ERP remains unchanged during negotiation and that a short "oui" creates drafts only at the accepted price.
 Run cd apps/ai && uv run pytest. The old voice path is available for regression comparison.
+
+The existing market dashboard now streams real request/quote events per product, including withdrawn quotes and the final procurement allocation. For a multi-product basket the dashboard follows the latest product round; the voice offer card displays the entire basket. The trace represents quote selection, not supplier acceptance.

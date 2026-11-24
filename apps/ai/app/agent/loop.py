@@ -57,7 +57,7 @@ async def run_agent(
     usage = Usage(input_tokens=0, output_tokens=0)
 
     try:
-        system = await build_system_prompt(mode, actor_name, negotiation_first=negotiation_first)
+        system = await build_system_prompt(mode, actor_name, negotiation_first=True) if negotiation_first else await build_system_prompt(mode, actor_name)
         # Voice and one-shot commands: no reasoning pass before answering (settings.voice_thinking, VOICE_THINKING).
         thinking = settings.voice_thinking if mode in ("voice", "command") else None
         request = LLMRequest(system=system, messages=messages, tools=[t.info for t in tools], thinking=thinking)

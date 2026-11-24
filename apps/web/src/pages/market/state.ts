@@ -79,6 +79,7 @@ export function applyEvent(r: RoundView, e: MarketEvent): RoundView {
       return {
         ...r, t, calls: call(e.call, (c) => {
           const offers = { ...c.offers };
+          if (d.withdrawnProductId) delete offers[d.withdrawnProductId];
           for (const o of d.offers ?? []) offers[o.productId] = { ...o, opening: c.offers[o.productId]?.opening ?? o.price };
           return { ...c, offers };
         }),

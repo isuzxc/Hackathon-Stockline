@@ -236,7 +236,7 @@ def optimize(line: NeedLine, quotes: list[Quote], profiles: dict[str, SupplierPr
 
 
 async def run(line: NeedLine, profiles: dict[str, SupplierProfile], today: date, deadline: date,
-              seed: str, *, external: bool = False, endpoints: dict[str, str] | None = None):
+              seed: str, *, external: bool = False, endpoints: dict[str, str] | None = None, on_exchange=None):
     """Concurrent quote/counter rounds. All actors see the same previous-round snapshot."""
     session = uuid.uuid4().hex
     async with httpx.AsyncClient(timeout=1.1, follow_redirects=False, trust_env=False) as client:
@@ -249,9 +249,15 @@ async def run(line: NeedLine, profiles: dict[str, SupplierProfile], today: date,
             else:
                 shop = Shop(profile, line, today, seed)
             agents[sid] = BuyerAgent(profile, line, shop, deadline, session)
+        async def dispatch(agent, board, round_no):
+            count = len(agent.history)
+            await agent.exchange(board, round_no)
+            if len(agent.history) != count and on_exchange:
+                await on_exchange(agent.profile.id, agent.history[-1])
+
         board = ()
         for round_no in range(3):
-            await asyncio.gather(*(a.exchange(board, round_no) for a in agents.values()))
+            await asyncio.gather(*(dispatch(a, board, round_no) for a in agents.values()))
             board = tuple(a.quote for a in agents.values() if a.quote and a.quote.expires > datetime.now(timezone.utc))
             if not board or all(q.offer.final for q in board):
                 break
