@@ -59,6 +59,15 @@ class OfferBoard:
             return self._product(args.get("qty"), result)
         if name == "source_product":
             return self._sourced(args, result)
+        if name == "negotiate_basket" and result.get("found"):
+            self.lines.clear()
+            for item in result.get("lines", []):
+                label = item["product"]
+                self.lines[label] = OfferLine(product=label, qty=item["qty"], unit=item["unit"],
+                    unit_price=item["unitPrice"], total=item["total"],
+                    availability="Offre négociée (simulation)" if result.get("mode") == "demo" else "Offre négociée",
+                    delivery=day(result.get("deliveryDate"), self.today))
+            return True
         return False
 
     def _product(self, qty: float | None, r: dict) -> bool:

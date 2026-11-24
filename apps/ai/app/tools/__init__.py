@@ -14,7 +14,7 @@ The tools the model can call, grouped by domain. Each one wraps ERP API endpoint
 A new file needs one more line: import it below so its @tool functions get registered.
 """
 
-from . import catalog, context, history, market, orders, voice  # noqa: F401  (importing registers the tools)
+from . import catalog, context, history, market, negotiation, orders, voice  # noqa: F401  (importing registers the tools)
 from .erp import ErpClient
 from .registry import TOOLS, Tool, ToolContext, tool
 

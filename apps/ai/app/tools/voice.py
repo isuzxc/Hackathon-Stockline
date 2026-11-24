@@ -295,7 +295,8 @@ async def find_product(
     )
 
     if (
-        compare
+        not ctx.session_id
+        and compare
         and client_id
         and delivery_date
         and qty is not None

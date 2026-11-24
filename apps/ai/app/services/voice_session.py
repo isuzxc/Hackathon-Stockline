@@ -77,6 +77,7 @@ from app.tools import ErpClient, all_tools
 from .model_router import fast_client, route
 from .fast_path import MAX_CONFIRM_WORDS, Injected, caller_blocked, fast_confirm, preload
 from .offer import OfferBoard
+from .negotiation import enabled as negotiation_enabled
 from .utterance import Utterance
 from .vocabulary import stt_hint
 
@@ -114,7 +115,8 @@ FIRST_ACK = "Oui, un instant."  # first turn of a call: the caller usually just 
 
 # The status line while the model's own tools run (the preload sends its own).
 STATUS_ON_CALL = {"identify_caller": "Recherche des offres…", "find_product": "Recherche des offres…",
-                  "check_stock": "Vérification du stock…", "source_product": "Comparaison des prix…"}  # fmt: skip
+                  "check_stock": "Vérification du stock…", "source_product": "Comparaison des prix…",
+                  "negotiate_basket": "Les agents négocient avec les fournisseurs…", "accept_negotiated_offer": "Enregistrement de l’offre…"}  # fmt: skip
 
 # Writes whose result the model is told to read back BEFORE calling them (VOICE_RULES: « écris d'abord ta phrase …
 # PUIS appelle create_draft_order … Après le résultat de l'outil, n'écris plus rien, sauf erreur ou alerte »).
@@ -468,7 +470,8 @@ class VoiceConnection:
             # 2a. Fast paths (services/fast_path.py): « oui c'est bon » after a recap = confirmed in code, no model call;
             #     otherwise the caller / products named are looked up in code so the model answers in one call.
             erp = ErpClient("voice_agent", conv.actor_name)
-            if fast := await fast_confirm(working, erp, today):
+            negotiation_first = negotiation_enabled()
+            if not negotiation_first and (fast := await fast_confirm(working, erp, today)):
                 working += fast.messages
                 await self._show_injected(fast)
                 add_injected_timings(timings, t0, fast)
@@ -485,7 +488,7 @@ class VoiceConnection:
                 return
             # Instant « Parfait, c'est noté. » only after a real order recap (« … Je valide ? »): never after an alternative,
             # a market offer or any other question — a yes to those is not a confirmation (Abel, 05:05).
-            optimistic = len(heard.split()) <= MAX_CONFIRM_WORDS and last_reply_asks_validation(conv.history) \
+            optimistic = not negotiation_first and len(heard.split()) <= MAX_CONFIRM_WORDS and last_reply_asks_validation(conv.history) \
                 and may_confirm(working, "voice") and not caller_blocked(working)
             if optimistic:
                 spoken = f"{YES_ACK} "
@@ -494,7 +497,7 @@ class VoiceConnection:
                 speaker.filler(YES_ACK)  # pre-rendered: plays at once
             confirmed: dict | None = None
             try:  # the ERP is local (~0.1 s); never let a slow ERP hold the turn: then the model looks things up itself
-                pre = await asyncio.wait_for(preload(working, erp, self._status), PRELOAD_TIMEOUT_S)
+                pre = None if negotiation_first else await asyncio.wait_for(preload(working, erp, self._status), PRELOAD_TIMEOUT_S)
             except TimeoutError:
                 pre = None
             if pre:
@@ -508,10 +511,16 @@ class VoiceConnection:
             hush, step_asked, step_quiet, in_tools, after_results = False, False, True, False, False
             step_written, hush_warned = True, False  # every call of the step was a write that went through
             step_said, step_logs = False, False  # the step's text came before its calls; all its calls were log_client_event
-            llm, why = route(get_llm_client(), heard, conv.history, bool(pre), optimistic, caller_blocked(working))
+            llm, why = (get_llm_client(), "negotiation-first") if negotiation_first else route(get_llm_client(), heard, conv.history, bool(pre), optimistic, caller_blocked(working))
             timings.llm_model = f"{getattr(llm, 'model', llm.provider)} ({why})"
             print(f"[route] {timings.llm_model}", flush=True)
-            async for ev in run_agent(working, llm=llm, tools=all_tools(), mode="voice", actor_name=conv.actor_name):
+            tools = all_tools()
+            if negotiation_first:
+                allowed = {"identify_caller", "find_product", "get_client", "get_context", "search_context",
+                           "get_order", "get_client_history", "negotiate_basket", "accept_negotiated_offer"}
+                tools = [t for t in tools if t.name in allowed]
+            async for ev in run_agent(working, llm=llm, tools=tools, mode="voice", actor_name=conv.actor_name,
+                                      session_id=conv.id if negotiation_first else None):
                 match ev:
                     case TextEvent(delta=delta) if hush or optimistic:
                         hushed += delta

@@ -35,6 +35,7 @@ from .erp import Actor, ErpClient
 class ToolContext:
     erp: ErpClient  # HTTP client for the ERP API, already tagged with x-actor
     actor: Actor  # "ai_chat" (web chat) or "voice_agent" (phone / voice commands)
+    session_id: str | None = None
 
 
 class ToolArgs(BaseModel):

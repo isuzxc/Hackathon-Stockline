@@ -48,14 +48,16 @@ async def run_agent(
     mode: ChatMode = "chat",  # command = single turn, act-first
     actor_name: str | None = None,
     max_steps: int | None = None,
+    session_id: str | None = None,
 ) -> AsyncIterator[ChatStreamEvent]:
     started = time.perf_counter()
     actor = "ai_chat" if mode == "chat" else "voice_agent"
-    ctx = ToolContext(erp=ErpClient(actor, actor_name), actor=actor)
+    ctx = ToolContext(erp=ErpClient(actor, actor_name), actor=actor, session_id=session_id)
+    negotiation_first = mode == 'voice' and session_id is not None
     usage = Usage(input_tokens=0, output_tokens=0)
 
     try:
-        system = await build_system_prompt(mode, actor_name)
+        system = await build_system_prompt(mode, actor_name, negotiation_first=negotiation_first)
         # Voice and one-shot commands: no reasoning pass before answering (settings.voice_thinking, VOICE_THINKING).
         thinking = settings.voice_thinking if mode in ("voice", "command") else None
         request = LLMRequest(system=system, messages=messages, tools=[t.info for t in tools], thinking=thinking)
@@ -73,7 +75,8 @@ async def run_agent(
                         text += delta
                         # streamed in every mode: in voice the first sentence is spoken while the rest is written
                         # (narration before a tool is filtered by the voice session: META_TALK, recap said once)
-                        yield TextEvent(delta=shown)
+                        if not negotiation_first:
+                            yield TextEvent(delta=shown)
                     case LLMToolCall(call=call):
                         calls.append(call)
                         yield ToolCallEvent(call=call)
@@ -88,16 +91,26 @@ async def run_agent(
 
             # 2. No tool call → that was the final answer.
             if not calls:
+                if negotiation_first and text:
+                    yield TextEvent(delta=text)
                 message = ChatMessage(role="assistant", content=text)
                 messages.append(message)
                 yield DoneEvent(message=message, usage=usage, ms=ms_since(started))
                 return
 
             # 3. Run the tools (in parallel), append the results, loop.
-            messages.append(ChatMessage(role="assistant", content=text, tool_calls=calls))
+            messages.append(ChatMessage(role="assistant", content="" if negotiation_first else text, tool_calls=calls))
             # Writes must execute in order: parallel draft creation and line changes can race.
             # Also enforce confirmation at the tool boundary, not merely in the prompt.
             async def guarded(call: ToolCall) -> ToolResultEvent:
+                if call.name in ("negotiate_basket", "accept_negotiated_offer"):
+                    from app.services.negotiation import approval_matches, pending
+                    if not negotiation_first or len(calls) != 1:
+                        return ToolResultEvent(call_id=call.id, name=call.name, ok=False,
+                            result={"error": "Une seule opération panier à la fois, dans une session Voix."}, ms=0)
+                    if call.name == "accept_negotiated_offer" and not approval_matches(messages, pending(session_id)):
+                        return ToolResultEvent(call_id=call.id, name=call.name, ok=False,
+                            result={"error": "Le client doit accepter explicitement le dernier récapitulatif exact."}, ms=0)
                 if call.name == "confirm_order" and not may_confirm(messages, mode):
                     return ToolResultEvent(call_id=call.id, name=call.name, ok=False,
                         result={"error": "Customer confirmation required after the assistant reads back the order. Ask for explicit approval; do not confirm yet."}, ms=0)
@@ -110,6 +123,15 @@ async def run_agent(
             for r in results:
                 messages.append(ChatMessage(role="tool", tool_call_id=r.call_id, name=r.name, content=to_json(r.result)))
                 yield r
+            if negotiation_first and len(results) == 1:
+                r = results[0]
+                if r.name in ("negotiate_basket", "accept_negotiated_offer") and r.ok and isinstance(r.result, dict) and r.result.get("say"):
+                    text = r.result["say"]
+                    message = ChatMessage(role="assistant", content=text)
+                    messages.append(message)
+                    yield TextEvent(delta=text)
+                    yield DoneEvent(message=message, usage=usage, ms=ms_since(started))
+                    return
 
         # Safety net: the model kept calling tools.
         message = ChatMessage(role="assistant", content=GIVE_UP)

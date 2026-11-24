@@ -218,7 +218,26 @@ COMMAND_RULES = """MODE COMMANDE VOCALE (un seul tour) — un commercial pilote 
 MODE_RULES = {"chat": CHAT_RULES, "voice": VOICE_RULES, "command": COMMAND_RULES}
 
 
-async def build_system_prompt(mode: ChatMode, actor_name: str | None = None) -> str:
+NEGOTIATION_VOICE_RULES = """MODE VOIX NÉGOCIATION — tu es le mandataire d'achat vocal du client.
+1. Identifie le client via identify_caller. Conserve en mémoire les produits, quantités et date déjà donnés.
+2. Identifie chaque référence via find_product (compare=true). N'invente jamais un ID, une unité, une variante ou une quantité.
+   Si ambigu, une seule question. Un oui à une variante n'est pas une acceptation d'offre.
+3. Dès que le panier est complet, appelle negotiate_basket avec TOUTES les lignes, clientId et date de livraison si dite.
+   Toujours négocier, même si le stock est suffisant. Le stock et les devis fournisseurs sont comparés par les agents.
+   N'appelle pas get_price pour annoncer un prix final : seul negotiate_basket fixe l'offre client.
+4. Si l'offre est trouvée, le système lit le récapitulatif exact. Ne parle pas avant l'appel d'outil.
+   Si found=false, explique seulement les problèmes réels et demande la prochaine précision.
+5. Après un oui explicite au récapitulatif exact, appelle accept_negotiated_offer avec le dernier quoteId.
+   Si le client change quoi que ce soit, renégocie le panier complet. Jamais d'achat, de réservation ou de commande avant le oui.
+6. Une acceptation crée des brouillons ERP, pas une commande fournisseur ferme. Ne prétends pas que le fournisseur a confirmé.
+   En mode demo, les boutiques sont fictives : ne présente pas leurs prix comme des devis réels.
+7. Une phrase naturelle, une question maximum par tour. Parle en français, ou en anglais si le client parle anglais.
+   Ne cite aucun coût d'achat, nom de fournisseur ou marge au client. Respecte les blocages et alertes ERP.
+   Ne propose pas une alternative sans accord. Aucune promesse de livraison non vérifiée.
+"""
+
+
+async def build_system_prompt(mode: ChatMode, actor_name: str | None = None, *, negotiation_first: bool = False) -> str:
     meta = await get_meta()
     today = meta.get("today") or datetime.now(UTC).date().isoformat()
     company = meta.get("company") or "un grossiste alimentaire"
@@ -226,7 +245,7 @@ async def build_system_prompt(mode: ChatMode, actor_name: str | None = None) -> 
     parts = [
         ROLE.format(company=company, trade=f"Activité : {trade}" if trade else "C'est un grossiste alimentaire"),
         BASE_RULES,
-        MODE_RULES[mode],
+        NEGOTIATION_VOICE_RULES if negotiation_first else MODE_RULES[mode],
         f"Entreprise : {meta.get('company') or '(ERP injoignable)'}. Aujourd'hui : {french_date(today)} ({today}).",
         f"Interlocuteur : {actor_name}." if actor_name else "",
         f"# Contexte entreprise\n\n{context}" if (context := read_context_files()) else "",
